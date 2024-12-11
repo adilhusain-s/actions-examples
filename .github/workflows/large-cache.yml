@@ -7,6 +7,7 @@ jobs:
   generate-cache:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-22.04-ppc64le]
 
@@ -27,7 +28,6 @@ jobs:
         with:
           path: cache_data
           key: large-file-cache-${{ matrix.os }}-${{ github.sha }}-${{ github.ref }}-${{ github.run_id }}
-          fail-on-cache-miss: true # Ensure workflow fails if no cache is created
 
       # Step 3: Confirm the cache is stored
       - name: List Cached Files
