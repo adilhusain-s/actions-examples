@@ -17,10 +17,7 @@ jobs:
         run: |
           mkdir -p cache_data
           echo "Generating a 1GB random data file on ${{ matrix.os }}..."
-          dd if=/dev/urandom of=cache_data/random_file_1GB bs=1M count=1024
-          echo "Generating another 1GB random data file on ${{ matrix.os }}..."
-          dd if=/dev/urandom of=cache_data/random_file_2GB bs=1M count=1024
-          echo "Generated 2GB of random data files on ${{ matrix.os }}."
+          time dd if=/dev/urandom of=cache_data/random_file_1GB bs=1M count=1024
 
       # Step 2: Cache the large files with a single unique key
       - name: Cache Large Files
