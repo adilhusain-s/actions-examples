@@ -22,5 +22,5 @@ jobs:
         run: |
           echo "Generating large logs on ${{ matrix.os }}..."
           echo "Using Runner Owner: ${{ matrix.runner_owner }}..."
-          time yes "example line log" | head -n 10000
+          time yes "example line log" | head -n 50000
           echo "Log generation complete for ${{ matrix.os }}."
