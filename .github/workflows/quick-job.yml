@@ -12,6 +12,5 @@ jobs:
     steps:
       - name: Run commands
         run: |
-          uname -a
-          arch
-
+          time uname -a
+          time arch
