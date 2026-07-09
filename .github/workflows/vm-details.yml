@@ -6,7 +6,7 @@ jobs:
   test_job:
     strategy:
       matrix:
-        os: [ubuntu-latest, ubuntu-22.04-ppc64le]
+        os: [ubuntu-latest, ubuntu-24.04-ppc64le-vm]
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.os }}
     steps:

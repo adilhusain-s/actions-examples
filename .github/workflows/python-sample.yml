@@ -6,7 +6,7 @@ on:
 
 jobs:
   run-python-sample:
-    runs-on: ubuntu-24.04-ppc64le
+    runs-on: ubuntu-24.04-ppc64le-vm
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
