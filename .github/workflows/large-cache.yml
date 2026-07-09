@@ -21,7 +21,7 @@ jobs:
 
       # Step 2: Cache the large files with a single unique key
       - name: Cache Large Files
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: cache_data
           key: large-file-cache-${{ matrix.os }}-${{ github.sha }}-${{ github.ref }}-${{ github.run_id }}
