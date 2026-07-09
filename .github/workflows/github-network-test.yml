@@ -30,7 +30,7 @@ jobs:
           ./github-network-test.sh
 
       - name: Upload Generated Tar File
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.runner_owner }}-${{ github.run_id }}-${{ github.run_number }}.tar.gz
           path: /tmp/github-logs/*.tar.gz
