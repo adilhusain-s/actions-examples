@@ -409,6 +409,15 @@ jobs:
         run: |
           set -euo pipefail
 
+          case "$CONFORMANCE_ARCH" in
+            amd64|arm64)
+              ;;
+            *)
+              echo "::warning::Skipping Helm install on unsupported architecture: $CONFORMANCE_ARCH"
+              exit 0
+              ;;
+          esac
+
           if command -v helm >/dev/null 2>&1; then
             helm version
             exit 0
@@ -921,14 +930,21 @@ jobs:
             --serviceaccount="$TEST_NAMESPACE:conformance-reader" \
             -n "$TEST_NAMESPACE"
 
-          kubectl auth can-i get pods \
+          if ! kubectl auth can-i get pods \
             -n "$TEST_NAMESPACE" \
             --as="system:serviceaccount:$TEST_NAMESPACE:conformance-reader" \
-            | grep -qx "yes"
+            --quiet; then
+            echo "::error::Expected conformance-reader to be able to get pods in $TEST_NAMESPACE"
+            exit 1
+          fi
 
-          kubectl auth can-i delete namespaces \
+          if kubectl auth can-i delete namespaces \
             --as="system:serviceaccount:$TEST_NAMESPACE:conformance-reader" \
-            | grep -qx "no"
+            --quiet \
+            2>/dev/null; then
+            echo "::error::conformance-reader must not be allowed to delete namespaces"
+            exit 1
+          fi
 
           echo "ServiceAccount / Role / RoleBinding: PASS"
 
@@ -1163,19 +1179,22 @@ jobs:
           echo "=== Docker Networks ==="
           docker network ls
 
-          if command -v kubectl >/dev/null 2>&1; then
+          if command -v kubectl >/dev/null 2>&1 && kubectl cluster-info >/dev/null 2>&1; then
             echo ""
             echo "=== Kubernetes Nodes ==="
-            kubectl get nodes -o wide
+            kubectl get nodes -o wide || true
 
             echo ""
             echo "=== Kubernetes Pods ==="
-            kubectl get pods -A -o wide
+            kubectl get pods -A -o wide || true
 
             echo ""
             echo "=== Kubernetes Events ==="
             kubectl get events -A \
-              --sort-by='.lastTimestamp'
+              --sort-by='.lastTimestamp' || true
+          else
+            echo ""
+            echo "No reachable Kubernetes API context; skipping kubectl diagnostics."
           fi
 
       # ============================================================
