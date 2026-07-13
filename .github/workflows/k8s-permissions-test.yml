@@ -1,72 +1,37 @@
-name: K8s Runner Access & Permissions Test
+name: Kubernetes CI Runner Conformance
 
 on:
   workflow_dispatch:
-    inputs:
-      kubeconfig:
-        description: "Kubeconfig content, base64 encoded"
-        required: true
-        type: string
 
-      namespace:
-        description: "Kubernetes namespace to test"
-        required: true
-        default: "default"
-        type: string
-
-      test-image:
-        description: "Container image for workload tests; must support the Kubernetes node architecture"
-        required: true
-        default: "registry.k8s.io/pause:3.10"
-        type: string
+permissions:
+  contents: read
 
 env:
-  KUBECONFIG: /tmp/kubeconfig
-  TEST_IMAGE: ${{ inputs.test-image }}
+  TEST_NAMESPACE: runner-conformance
+  KIND_CLUSTER_PREFIX: runner-conformance
+  TEST_IMAGE_PREFIX: runner-conformance-app
 
 jobs:
-  k8s-permissions-test:
-    name: K8s Test - ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+  runner-conformance:
+    name: Conformance - ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
 
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-24.04-ppc64le-vm
+        runner:
           - ubuntu-22.04
+          - ubuntu-24.04-ppc64le-vm
 
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       # ============================================================
-      # 1. Runner diagnostics
+      # 1. Create unique per-job environment
       # ============================================================
 
-      - name: "[Setup] Runner Information"
-        id: runner
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "=== Runner Information ==="
-          echo "Runner label: ${{ matrix.os }}"
-          echo "Hostname: $(hostname)"
-          echo "OS:"
-          cat /etc/os-release || true
-          echo ""
-          echo "Kernel:"
-          uname -a
-          echo ""
-          echo "Architecture:"
-          uname -m
-
-      # ============================================================
-      # 2. Detect runner architecture
-      # ============================================================
-
-      - name: "[Setup] Detect Architecture"
-        id: arch
+      - name: "[Setup] Create Unique Test Environment"
+        id: unique
         shell: bash
         run: |
           set -euo pipefail
@@ -75,63 +40,342 @@ jobs:
 
           case "$RAW_ARCH" in
             x86_64)
-              K8S_ARCH="amd64"
+              ARCH="amd64"
               ;;
             aarch64|arm64)
-              K8S_ARCH="arm64"
+              ARCH="arm64"
               ;;
             ppc64le)
-              K8S_ARCH="ppc64le"
+              ARCH="ppc64le"
               ;;
             s390x)
-              K8S_ARCH="s390x"
+              ARCH="s390x"
               ;;
             *)
-              echo "::error::Unsupported runner architecture: $RAW_ARCH"
-              exit 1
+              ARCH="$RAW_ARCH"
               ;;
           esac
 
-          echo "Raw runner architecture: $RAW_ARCH"
-          echo "Kubernetes binary architecture: $K8S_ARCH"
+          # Unique to this workflow run + matrix job.
+          TEST_ID="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ strategy.job-index }}"
+          CLUSTER_NAME="${KIND_CLUSTER_PREFIX}-${TEST_ID}"
+          TEST_IMAGE="${TEST_IMAGE_PREFIX}:${TEST_ID}"
+          WORK_DIR="$(mktemp -d -t runner-conformance.XXXXXXXX)"
 
+          chmod 700 "$WORK_DIR"
+
+          echo "arch=$ARCH" >> "$GITHUB_OUTPUT"
           echo "raw_arch=$RAW_ARCH" >> "$GITHUB_OUTPUT"
-          echo "k8s_arch=$K8S_ARCH" >> "$GITHUB_OUTPUT"
+          echo "test_id=$TEST_ID" >> "$GITHUB_OUTPUT"
+          echo "cluster_name=$CLUSTER_NAME" >> "$GITHUB_OUTPUT"
+          echo "test_image=$TEST_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "work_dir=$WORK_DIR" >> "$GITHUB_OUTPUT"
+
+          echo "TEST_ID=$TEST_ID" >> "$GITHUB_ENV"
+          echo "CLUSTER_NAME=$CLUSTER_NAME" >> "$GITHUB_ENV"
+          echo "TEST_IMAGE=$TEST_IMAGE" >> "$GITHUB_ENV"
+          echo "WORK_DIR=$WORK_DIR" >> "$GITHUB_ENV"
+          echo "RUNNER_ARCH=$ARCH" >> "$GITHUB_ENV"
+
+          echo "Test ID:       $TEST_ID"
+          echo "Runner arch:   $ARCH"
+          echo "Cluster name:  $CLUSTER_NAME"
+          echo "Test image:    $TEST_IMAGE"
+          echo "Work dir:      $WORK_DIR"
 
       # ============================================================
-      # 3. Install kubectl
+      # 2. Host diagnostics
       # ============================================================
 
-      - name: "[Setup] Install kubectl"
+      - name: "[Host] System Information"
         shell: bash
         run: |
           set -euo pipefail
 
-          K8S_ARCH="${{ steps.arch.outputs.k8s_arch }}"
+          echo "=== Identity ==="
+          id
 
-          echo "Getting latest stable Kubernetes version..."
+          echo ""
+          echo "=== Hostname ==="
+          hostname
 
-          KUBECTL_VERSION="$(
+          echo ""
+          echo "=== Kernel ==="
+          uname -a
+
+          echo ""
+          echo "=== Architecture ==="
+          uname -m
+
+          echo ""
+          echo "=== OS ==="
+          cat /etc/os-release || true
+
+          echo ""
+          echo "=== CPU ==="
+          nproc
+          lscpu || true
+
+          echo ""
+          echo "=== Memory ==="
+          free -h || true
+
+          echo ""
+          echo "=== Disk ==="
+          df -h
+
+          echo ""
+          echo "=== Cgroups ==="
+          mount | grep cgroup || true
+
+          if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+            echo "cgroup v2 detected"
+            cat /sys/fs/cgroup/cgroup.controllers
+          else
+            echo "cgroup v1 or hybrid detected"
+          fi
+
+      # ============================================================
+      # 3. Filesystem capabilities
+      # ============================================================
+
+      - name: "[Host] Filesystem Test"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TEST_DIR="$WORK_DIR/filesystem"
+          mkdir -p "$TEST_DIR"
+
+          echo "hello" > "$TEST_DIR/file"
+
+          test "$(cat "$TEST_DIR/file")" = "hello"
+
+          ln -s "$TEST_DIR/file" "$TEST_DIR/symlink"
+          test -L "$TEST_DIR/symlink"
+
+          chmod 600 "$TEST_DIR/file"
+
+          cp "$TEST_DIR/file" "$TEST_DIR/copy"
+          mv "$TEST_DIR/copy" "$TEST_DIR/moved"
+
+          rm -rf "$TEST_DIR"
+
+          echo "Filesystem test: PASS"
+
+      # ============================================================
+      # 4. Network and DNS
+      # ============================================================
+
+      - name: "[Host] Network and DNS Test"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== DNS ==="
+          getent hosts github.com
+          getent hosts registry-1.docker.io || true
+          getent hosts dl.k8s.io
+
+          echo ""
+          echo "=== HTTPS ==="
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            --connect-timeout 15 \
+            --output /dev/null \
+            https://github.com
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            --connect-timeout 15 \
+            --output /dev/null \
+            https://dl.k8s.io
+
+          echo "Network test: PASS"
+
+      # ============================================================
+      # 5. Docker availability
+      # ============================================================
+
+      - name: "[Container] Validate Docker"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          command -v docker
+
+          docker version
+          docker info
+
+          echo ""
+          echo "Docker validation: PASS"
+
+      # ============================================================
+      # 6. Standard container lifecycle
+      # ============================================================
+
+      - name: "[Container] Pull and Run Container"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker run \
+            --rm \
+            busybox:latest \
+            sh -c '
+              echo "container architecture: $(uname -m)"
+              echo "container execution: PASS"
+            '
+
+      # ============================================================
+      # 7. Docker networking
+      # ============================================================
+
+      - name: "[Container] Docker Network Test"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NETWORK="conformance-net-$TEST_ID"
+
+          cleanup() {
+            docker network rm "$NETWORK" >/dev/null 2>&1 || true
+          }
+
+          trap cleanup EXIT
+
+          docker network create "$NETWORK"
+          docker network inspect "$NETWORK" >/dev/null
+
+          echo "Docker network test: PASS"
+
+      # ============================================================
+      # 8. Docker volume
+      # ============================================================
+
+      - name: "[Container] Docker Volume Test"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VOLUME="conformance-volume-$TEST_ID"
+
+          cleanup() {
+            docker volume rm "$VOLUME" >/dev/null 2>&1 || true
+          }
+
+          trap cleanup EXIT
+
+          docker volume create "$VOLUME"
+
+          docker run \
+            --rm \
+            -v "$VOLUME:/data" \
+            busybox:latest \
+            sh -c 'echo conformance > /data/test'
+
+          RESULT="$(
+            docker run \
+              --rm \
+              -v "$VOLUME:/data" \
+              busybox:latest \
+              cat /data/test
+          )"
+
+          test "$RESULT" = "conformance"
+
+          echo "Docker volume test: PASS"
+
+      # ============================================================
+      # 9. Privileged container capability
+      #
+      # Important for nested/containerized infrastructure patterns.
+      # ============================================================
+
+      - name: "[Container] Privileged Container Test"
+        id: privileged
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker run \
+            --rm \
+            --privileged \
+            busybox:latest \
+            sh -c '
+              test -d /sys
+              test -d /proc
+              echo "privileged container: PASS"
+            '
+
+      # ============================================================
+      # 10. Build a local image
+      # ============================================================
+
+      - name: "[Container] Build Local Test Image"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_DIR="$WORK_DIR/app"
+          mkdir -p "$APP_DIR"
+
+          cat > "$APP_DIR/Dockerfile" <<'EOF'
+          FROM busybox:latest
+
+          RUN mkdir -p /www
+
+          RUN printf '%s\n' \
+            '<html>' \
+            '<body>' \
+            'runner-conformance-ok' \
+            '</body>' \
+            '</html>' \
+            > /www/index.html
+
+          EXPOSE 8080
+
+          CMD ["httpd", "-f", "-p", "8080", "-h", "/www"]
+          EOF
+
+          docker build \
+            --tag "$TEST_IMAGE" \
+            "$APP_DIR"
+
+          docker image inspect "$TEST_IMAGE" >/dev/null
+
+          echo "Local image build: PASS"
+
+      # ============================================================
+      # 11. Install kubectl
+      # ============================================================
+
+      - name: "[Tools] Install kubectl"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="$(
             curl \
               --fail \
               --silent \
               --show-error \
               --location \
-              --retry 5 \
-              --retry-delay 3 \
-              --connect-timeout 15 \
               https://dl.k8s.io/release/stable.txt
           )"
 
-          if [ -z "$KUBECTL_VERSION" ]; then
-            echo "::error::Could not determine the stable kubectl version"
-            exit 1
-          fi
+          URL="https://dl.k8s.io/release/${VERSION}/bin/linux/${RUNNER_ARCH}/kubectl"
 
-          echo "kubectl version: $KUBECTL_VERSION"
-          echo "kubectl architecture: linux/$K8S_ARCH"
-
-          KUBECTL_URL="https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${K8S_ARCH}/kubectl"
+          echo "Downloading: $URL"
 
           curl \
             --fail \
@@ -139,619 +383,853 @@ jobs:
             --location \
             --retry 5 \
             --retry-delay 3 \
-            --connect-timeout 15 \
-            --output kubectl \
-            "$KUBECTL_URL"
+            --output "$WORK_DIR/kubectl" \
+            "$URL"
 
-          chmod +x kubectl
+          chmod +x "$WORK_DIR/kubectl"
 
-          # Avoid requiring sudo when possible.
           mkdir -p "$HOME/.local/bin"
-          mv kubectl "$HOME/.local/bin/kubectl"
+          cp "$WORK_DIR/kubectl" "$HOME/.local/bin/kubectl"
 
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-          # GITHUB_PATH is applied to subsequent steps, so use the
-          # full path for verification in this step.
           "$HOME/.local/bin/kubectl" version --client
 
       # ============================================================
-      # 4. Create and validate kubeconfig
-      # ============================================================
-
-      - name: "[Setup] Create and Validate Kubeconfig"
-        id: kubeconfig
-        shell: bash
-        env:
-          KUBECONFIG_B64: ${{ inputs.kubeconfig }}
-        run: |
-          set -euo pipefail
-
-          echo "Creating kubeconfig at: $KUBECONFIG"
-
-          if ! printf '%s' "$KUBECONFIG_B64" | base64 --decode > "$KUBECONFIG"; then
-            rm -f "$KUBECONFIG"
-            echo "::error::Failed to decode the base64-encoded kubeconfig"
-            exit 1
-          fi
-
-          unset KUBECONFIG_B64
-
-          if [ ! -s "$KUBECONFIG" ]; then
-            rm -f "$KUBECONFIG"
-            echo "::error::Decoded kubeconfig is empty"
-            exit 1
-          fi
-
-          chmod 600 "$KUBECONFIG"
-
-          echo "Validating kubeconfig structure..."
-
-          if ! kubectl config view >/dev/null; then
-            echo "::error::The decoded file is not a valid kubeconfig"
-            exit 1
-          fi
-
-          CURRENT_CONTEXT="$(kubectl config current-context 2>/dev/null || true)"
-
-          if [ -z "$CURRENT_CONTEXT" ]; then
-            echo "::error::The kubeconfig has no current context"
-            exit 1
-          fi
-
-          echo "Current context: $CURRENT_CONTEXT"
-          echo "Kubeconfig created and validated successfully."
-
-          echo "current_context=$CURRENT_CONTEXT" >> "$GITHUB_OUTPUT"
-
-      # ============================================================
-      # 5. Test API connectivity
+      # 12. Install Helm
       #
-      # Failure here is fatal. The purpose of this workflow is to
-      # prove that this specific runner can reach the K8s API.
+      # Build from source when a release artifact is unavailable.
+      # This also validates Go-based OSS tooling on the runner.
       # ============================================================
 
-      - name: "[Connectivity] Test Kubernetes API"
-        id: connectivity
+      - name: "[Tools] Install Helm"
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "=== Kubernetes API Endpoint ==="
-
-          API_SERVER="$(
-            kubectl config view \
-              --minify \
-              -o jsonpath='{.clusters[0].cluster.server}'
-          )"
-
-          if [ -z "$API_SERVER" ]; then
-            echo "::error::Could not determine the Kubernetes API server"
-            exit 1
+          if command -v helm >/dev/null 2>&1; then
+            helm version
+            exit 0
           fi
 
-          echo "API server: $API_SERVER"
-          echo "api_server=$API_SERVER" >> "$GITHUB_OUTPUT"
+          if command -v go >/dev/null 2>&1; then
+            echo "Installing Helm using Go..."
 
-          echo ""
-          echo "=== Testing API Connectivity ==="
+            GOBIN="$HOME/.local/bin" \
+              go install helm.sh/helm/v3/cmd/helm@latest
 
-          if ! API_VERSION="$(
-            kubectl \
-              --request-timeout=20s \
-              get --raw=/version
-          )"; then
-            echo "::error::The runner could not successfully reach the Kubernetes API"
-            exit 1
-          fi
-
-          echo "$API_VERSION"
-          echo ""
-          echo "Kubernetes API connectivity: PASS"
-
-      # ============================================================
-      # 6. Test authentication and namespace access
-      # ============================================================
-
-      - name: "[Auth] Validate Authentication"
-        id: auth
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          NS="${{ inputs.namespace }}"
-
-          echo "=== Authentication Test ==="
-
-          # kubectl auth can-i is an authenticated API request.
-          # A successful command proves the credentials were accepted,
-          # even if the RBAC answer itself is "no".
-          if ! AUTH_RESULT="$(
-            kubectl \
-              --request-timeout=20s \
-              auth can-i get pods \
-              -n "$NS" 2>&1
-          )"; then
-            echo "$AUTH_RESULT"
-            echo "::error::Authentication or authorization API request failed"
-            exit 1
-          fi
-
-          echo "Authentication request succeeded."
-          echo "Can get pods in namespace '$NS': $AUTH_RESULT"
-
-          echo ""
-          echo "=== Current Context ==="
-          kubectl config current-context
-
-          echo ""
-          echo "=== Configured User Name ==="
-          CONFIGURED_USER="$(
-            kubectl config view \
-              --minify \
-              -o jsonpath='{.contexts[0].context.user}' \
-              2>/dev/null || true
-          )"
-
-          if [ -n "$CONFIGURED_USER" ]; then
-            echo "$CONFIGURED_USER"
+            "$HOME/.local/bin/helm" version
           else
-            echo "User name is not explicitly available in kubeconfig."
+            echo "::error::Helm is not installed and Go is unavailable."
+            exit 1
           fi
 
-          echo "configured_user=$CONFIGURED_USER" >> "$GITHUB_OUTPUT"
-
       # ============================================================
-      # 7. Collect cluster information
+      # 13. Determine ephemeral cluster support
+      #
+      # kind is the primary representative OSS CI pattern.
+      #
+      # We deliberately do not pretend that an unsupported upstream
+      # architecture is a runner permission failure.
       # ============================================================
 
-      - name: "[Cluster] Collect Cluster Information"
+      - name: "[Cluster] Select Cluster Strategy"
+        id: cluster_strategy
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "=== Kubernetes Version ==="
-          kubectl version
+          case "$RUNNER_ARCH" in
+            amd64|arm64)
+              echo "strategy=kind" >> "$GITHUB_OUTPUT"
+              echo "supported=true" >> "$GITHUB_OUTPUT"
 
-          echo ""
-          echo "=== Cluster Information ==="
+              echo "Using standard kind CI pattern."
+              ;;
+
+            ppc64le)
+              echo "strategy=unsupported-upstream-kind-node-image" >> "$GITHUB_OUTPUT"
+              echo "supported=false" >> "$GITHUB_OUTPUT"
+
+              echo "::warning::Official kind node-image support cannot be assumed for ppc64le."
+              echo "::warning::Host and container-runtime conformance tests will still run."
+              ;;
+
+            *)
+              echo "strategy=unsupported-architecture" >> "$GITHUB_OUTPUT"
+              echo "supported=false" >> "$GITHUB_OUTPUT"
+
+              echo "::warning::No validated ephemeral cluster strategy for $RUNNER_ARCH."
+              ;;
+          esac
+
+      # ============================================================
+      # 14. Install kind
+      # ============================================================
+
+      - name: "[Cluster] Install kind"
+        if: steps.cluster_strategy.outputs.supported == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if command -v go >/dev/null 2>&1; then
+            echo "Installing kind from source..."
+
+            GOBIN="$HOME/.local/bin" \
+              go install sigs.k8s.io/kind@latest
+
+            "$HOME/.local/bin/kind" version
+          else
+            echo "::error::Go is required to install kind in this conformance workflow."
+            exit 1
+          fi
+
+      # ============================================================
+      # 15. Create a unique ephemeral Kubernetes cluster
+      # ============================================================
+
+      - name: "[Cluster] Create Ephemeral Kubernetes Cluster"
+        id: cluster
+        if: steps.cluster_strategy.outputs.supported == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KIND_CONFIG="$WORK_DIR/kind-config.yaml"
+
+          cat > "$KIND_CONFIG" <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+          EOF
+
+          kind create cluster \
+            --name "$CLUSTER_NAME" \
+            --config "$KIND_CONFIG" \
+            --wait 180s
+
+          echo "Cluster creation: PASS"
+
+      # ============================================================
+      # 16. Validate cluster health
+      # ============================================================
+
+      - name: "[Cluster] Validate Cluster Health"
+        if: steps.cluster_strategy.outputs.supported == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
           kubectl cluster-info
 
           echo ""
-          echo "=== Kubernetes Nodes and Architectures ==="
+          echo "=== Nodes ==="
 
-          if kubectl auth can-i list nodes 2>/dev/null | grep -qx "yes"; then
-            kubectl get nodes \
-              -o custom-columns='NAME:.metadata.name,ARCH:.status.nodeInfo.architecture,OS:.status.nodeInfo.operatingSystem,KUBELET:.status.nodeInfo.kubeletVersion'
+          kubectl get nodes -o wide
 
-            echo ""
-            echo "NOTE:"
-            echo "Runner architecture and Kubernetes node architecture are independent."
-            echo "Runner architecture determines which kubectl binary is required."
-            echo "Node architecture determines which container images can run."
-          else
-            echo "RBAC does not allow listing Kubernetes nodes."
-          fi
-
-      # ============================================================
-      # 8. Namespace-scoped read tests
-      # ============================================================
-
-      - name: "[Read] Namespace-Scoped Resources"
-        shell: bash
-        run: |
-          set -u
-
-          NS="${{ inputs.namespace }}"
-
-          echo "=== Namespace: $NS ==="
-
-          for resource in \
-            pods \
-            services \
-            deployments \
-            configmaps \
-            secrets \
-            events \
-            ingresses \
-            persistentvolumeclaims
-          do
-            echo ""
-            echo "--- $resource ---"
-
-            if kubectl get "$resource" -n "$NS"; then
-              echo "RESULT: PASS - can list $resource"
-            else
-              echo "RESULT: DENIED/FAILED - cannot list $resource"
-            fi
-          done
-
-      # ============================================================
-      # 9. Cluster-scoped read tests
-      # ============================================================
-
-      - name: "[Read] Cluster-Scoped Resources"
-        shell: bash
-        run: |
-          set -u
-
-          for resource in \
-            nodes \
-            namespaces \
-            storageclasses \
-            persistentvolumes \
-            clusterroles \
-            clusterrolebindings \
-            customresourcedefinitions
-          do
-            echo ""
-            echo "--- $resource ---"
-
-            if kubectl get "$resource" >/dev/null; then
-              echo "RESULT: PASS - can list $resource"
-            else
-              echo "RESULT: DENIED/FAILED - cannot list $resource"
-            fi
-          done
-
-      # ============================================================
-      # 10. Fine-grained namespace RBAC checks
-      # ============================================================
-
-      - name: "[RBAC] Namespace-Scoped Permissions"
-        shell: bash
-        run: |
-          set -u
-
-          NS="${{ inputs.namespace }}"
-
-          echo "=== Namespace-Scoped RBAC Checks ==="
-          echo "Namespace: $NS"
-          echo ""
-
-          for resource in \
-            pods \
-            services \
-            deployments \
-            configmaps \
-            secrets \
-            events \
-            ingresses \
-            persistentvolumeclaims
-          do
-            for verb in \
-              get \
-              list \
-              watch \
-              create \
-              update \
-              patch \
-              delete
-            do
-              if RESULT="$(
-                kubectl auth can-i \
-                  "$verb" \
-                  "$resource" \
-                  -n "$NS" \
-                  2>&1
-              )"; then
-                echo "$verb $resource = $RESULT"
-              else
-                echo "$verb $resource = ERROR: $RESULT"
-              fi
-            done
-          done
-
-      # ============================================================
-      # 11. Fine-grained cluster RBAC checks
-      # ============================================================
-
-      - name: "[RBAC] Cluster-Scoped Permissions"
-        shell: bash
-        run: |
-          set -u
-
-          echo "=== Cluster-Scoped RBAC Checks ==="
-
-          for resource in \
-            nodes \
-            namespaces \
-            storageclasses \
-            persistentvolumes \
-            clusterroles \
-            clusterrolebindings
-          do
-            for verb in \
-              get \
-              list \
-              watch \
-              create \
-              update \
-              patch \
-              delete
-            do
-              if RESULT="$(
-                kubectl auth can-i \
-                  "$verb" \
-                  "$resource" \
-                  2>&1
-              )"; then
-                echo "$verb $resource = $RESULT"
-              else
-                echo "$verb $resource = ERROR: $RESULT"
-              fi
-            done
-          done
-
-      # ============================================================
-      # 12. Functional Pod API test
-      #
-      # This tests actual API create/get/delete access.
-      # Pod readiness is reported separately because scheduling/runtime
-      # behavior is not the same as RBAC permission.
-      # ============================================================
-
-      - name: "[Write] Test Pod Creation"
-        id: pod_test
-        shell: bash
-        env:
-          NS: ${{ inputs.namespace }}
-          TEST_NAME: permission-test-${{ github.run_id }}-${{ strategy.job-index }}
-        run: |
-          set -u
-
-          echo "Test resource: $TEST_NAME"
-          echo "Test image: $TEST_IMAGE"
-
-          CAN_CREATE="$(
-            kubectl auth can-i create pods -n "$NS" 2>/dev/null || true
-          )"
-
-          if [ "$CAN_CREATE" != "yes" ]; then
-            echo "SKIPPED: RBAC does not allow pod creation."
-            echo "result=SKIPPED" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "RBAC allows pod creation."
-
-          if ! kubectl run "$TEST_NAME" \
-            --image="$TEST_IMAGE" \
-            --restart=Never \
-            -n "$NS"; then
-
-            echo "FAIL: RBAC allowed pod creation, but the API create operation failed."
-            echo "result=CREATE_FAILED" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "PASS: Pod API creation succeeded."
-          echo "result=CREATED" >> "$GITHUB_OUTPUT"
-
-          echo ""
-          echo "=== Created Pod ==="
-          kubectl get pod "$TEST_NAME" -n "$NS" -o wide || true
-
-          echo ""
-          echo "=== Scheduling / Readiness Test ==="
-
-          if kubectl wait \
+          kubectl wait \
             --for=condition=Ready \
-            "pod/$TEST_NAME" \
-            -n "$NS" \
-            --timeout=45s; then
-
-            echo "PASS: Pod became Ready."
-            echo "runtime_result=READY" >> "$GITHUB_OUTPUT"
-          else
-            echo "INFO: Pod did not become Ready within 45 seconds."
-            echo "This does not invalidate the API/RBAC creation test."
-            echo "runtime_result=NOT_READY" >> "$GITHUB_OUTPUT"
-
-            echo ""
-            echo "=== Pod Diagnostics ==="
-            kubectl describe pod "$TEST_NAME" -n "$NS" || true
-          fi
-
-      # ============================================================
-      # 13. Functional Deployment test
-      # ============================================================
-
-      - name: "[Write] Test Deployment Creation and Scaling"
-        id: deployment_test
-        shell: bash
-        env:
-          NS: ${{ inputs.namespace }}
-          TEST_NAME: permission-deploy-${{ github.run_id }}-${{ strategy.job-index }}
-        run: |
-          set -u
-
-          CAN_CREATE="$(
-            kubectl auth can-i create deployments -n "$NS" 2>/dev/null || true
-          )"
-
-          if [ "$CAN_CREATE" != "yes" ]; then
-            echo "SKIPPED: RBAC does not allow deployment creation."
-            echo "result=SKIPPED" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if ! kubectl create deployment "$TEST_NAME" \
-            --image="$TEST_IMAGE" \
-            -n "$NS"; then
-
-            echo "FAIL: Deployment API creation failed."
-            echo "result=CREATE_FAILED" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "PASS: Deployment created."
-          echo "result=CREATED" >> "$GITHUB_OUTPUT"
+            node \
+            --all \
+            --timeout=120s
 
           echo ""
-          echo "=== Deployment ==="
-          kubectl get deployment "$TEST_NAME" -n "$NS" || true
+          echo "=== System Pods ==="
 
-          echo ""
-          echo "=== Scale Test ==="
-
-          if kubectl scale deployment "$TEST_NAME" \
-            --replicas=2 \
-            -n "$NS"; then
-
-            echo "PASS: Deployment scaling succeeded."
-            echo "scale_result=PASS" >> "$GITHUB_OUTPUT"
-          else
-            echo "FAIL: Deployment scaling failed."
-            echo "scale_result=FAIL" >> "$GITHUB_OUTPUT"
-          fi
-
-          echo ""
-          echo "=== Deployment Pods ==="
           kubectl get pods \
-            -n "$NS" \
-            -l "app=$TEST_NAME" \
-            -o wide || true
+            --all-namespaces \
+            -o wide
+
+          echo ""
+          echo "=== Node Architecture ==="
+
+          kubectl get nodes \
+            -o custom-columns='NAME:.metadata.name,ARCH:.status.nodeInfo.architecture,OS:.status.nodeInfo.operatingSystem,RUNTIME:.status.nodeInfo.containerRuntimeVersion'
+
+          echo ""
+          echo "Cluster health: PASS"
 
       # ============================================================
-      # 14. Functional Service test
+      # 17. Load locally built image into cluster
       # ============================================================
 
-      - name: "[Write] Test Service Creation"
-        id: service_test
+      - name: "[Cluster] Load Local Image"
+        if: steps.cluster_strategy.outputs.supported == 'true'
         shell: bash
-        env:
-          NS: ${{ inputs.namespace }}
-          TEST_NAME: permission-svc-${{ github.run_id }}-${{ strategy.job-index }}
         run: |
-          set -u
+          set -euo pipefail
 
-          CAN_CREATE="$(
-            kubectl auth can-i create services -n "$NS" 2>/dev/null || true
+          kind load docker-image \
+            "$TEST_IMAGE" \
+            --name "$CLUSTER_NAME"
+
+          echo "Local image import: PASS"
+
+      # ============================================================
+      # 18. Create isolated namespace
+      # ============================================================
+
+      - name: "[Kubernetes] Create Namespace"
+        if: steps.cluster_strategy.outputs.supported == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl create namespace "$TEST_NAMESPACE"
+
+          kubectl get namespace "$TEST_NAMESPACE"
+
+      # ============================================================
+      # 19. ConfigMap and Secret lifecycle
+      # ============================================================
+
+      - name: "[Kubernetes] ConfigMap and Secret"
+        if: steps.cluster_strategy.outputs.supported == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl create configmap conformance-config \
+            --from-literal=value=hello \
+            -n "$TEST_NAMESPACE"
+
+          kubectl create secret generic conformance-secret \
+            --from-literal=password=test-value \
+            -n "$TEST_NAMESPACE"
+
+          test "$(
+            kubectl get configmap conformance-config \
+              -n "$TEST_NAMESPACE" \
+              -o jsonpath='{.data.value}'
+          )" = "hello"
+
+          test "$(
+            kubectl get secret conformance-secret \
+              -n "$TEST_NAMESPACE" \
+              -o jsonpath='{.data.password}' \
+              | base64 --decode
+          )" = "test-value"
+
+          kubectl patch configmap conformance-config \
+            -n "$TEST_NAMESPACE" \
+            --type merge \
+            -p '{"data":{"value":"updated"}}'
+
+          test "$(
+            kubectl get configmap conformance-config \
+              -n "$TEST_NAMESPACE" \
+              -o jsonpath='{.data.value}'
+          )" = "updated"
+
+          echo "ConfigMap and Secret lifecycle: PASS"
+
+      # ============================================================
+      # 20. Deploy locally built application
+      # ============================================================
+
+      - name: "[Kubernetes] Deploy Local Image"
+        if: steps.cluster_strategy.outputs.supported == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "$WORK_DIR/app.yaml" <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: conformance-app
+            namespace: ${TEST_NAMESPACE}
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: conformance-app
+            template:
+              metadata:
+                labels:
+                  app: conformance-app
+              spec:
+                containers:
+                  - name: app
+                    image: ${TEST_IMAGE}
+                    imagePullPolicy: Never
+                    ports:
+                      - containerPort: 8080
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: conformance-app
+            namespace: ${TEST_NAMESPACE}
+          spec:
+            selector:
+              app: conformance-app
+            ports:
+              - port: 80
+                targetPort: 8080
+          EOF
+
+          kubectl apply -f "$WORK_DIR/app.yaml"
+
+          kubectl rollout status \
+            deployment/conformance-app \
+            -n "$TEST_NAMESPACE" \
+            --timeout=120s
+
+          kubectl get all \
+            -n "$TEST_NAMESPACE"
+
+          echo "Build -> load -> deploy: PASS"
+
+      # ============================================================
+      # 21. kubectl logs
+      # ============================================================
+
+      - name: "[Kubernetes] Test kubectl logs"
+        if: steps.cluster_strategy.outputs.supported == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          POD="$(
+            kubectl get pods \
+              -n "$TEST_NAMESPACE" \
+              -l app=conformance-app \
+              -o jsonpath='{.items[0].metadata.name}'
           )"
 
-          if [ "$CAN_CREATE" != "yes" ]; then
-            echo "SKIPPED: RBAC does not allow service creation."
-            echo "result=SKIPPED" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          kubectl logs \
+            "$POD" \
+            -n "$TEST_NAMESPACE"
 
-          if kubectl create service clusterip "$TEST_NAME" \
-            --tcp=80:80 \
-            -n "$NS"; then
-
-            echo "PASS: Service creation succeeded."
-            echo "result=CREATED" >> "$GITHUB_OUTPUT"
-          else
-            echo "FAIL: Service creation failed."
-            echo "result=CREATE_FAILED" >> "$GITHUB_OUTPUT"
-          fi
+          echo "kubectl logs: PASS"
 
       # ============================================================
-      # 15. GitHub Step Summary
+      # 22. kubectl exec
       # ============================================================
 
-      - name: "[Report] Write Test Summary"
+      - name: "[Kubernetes] Test kubectl exec"
+        if: steps.cluster_strategy.outputs.supported == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          POD="$(
+            kubectl get pods \
+              -n "$TEST_NAMESPACE" \
+              -l app=conformance-app \
+              -o jsonpath='{.items[0].metadata.name}'
+          )"
+
+          RESULT="$(
+            kubectl exec \
+              "$POD" \
+              -n "$TEST_NAMESPACE" \
+              -- sh -c 'echo exec-ok'
+          )"
+
+          test "$RESULT" = "exec-ok"
+
+          echo "kubectl exec: PASS"
+
+      # ============================================================
+      # 23. In-cluster DNS and Service networking
+      # ============================================================
+
+      - name: "[Networking] DNS and Service Test"
+        if: steps.cluster_strategy.outputs.supported == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl run network-client \
+            --image=busybox:latest \
+            --restart=Never \
+            -n "$TEST_NAMESPACE" \
+            --command \
+            -- sleep 300
+
+          kubectl wait \
+            --for=condition=Ready \
+            pod/network-client \
+            -n "$TEST_NAMESPACE" \
+            --timeout=120s
+
+          echo "=== DNS Test ==="
+
+          kubectl exec \
+            network-client \
+            -n "$TEST_NAMESPACE" \
+            -- nslookup kubernetes.default.svc.cluster.local
+
+          echo ""
+          echo "=== Service Test ==="
+
+          RESPONSE="$(
+            kubectl exec \
+              network-client \
+              -n "$TEST_NAMESPACE" \
+              -- wget \
+                -qO- \
+                http://conformance-app
+          )"
+
+          echo "$RESPONSE"
+
+          echo "$RESPONSE" | grep -q "runner-conformance-ok"
+
+          echo "Cluster DNS: PASS"
+          echo "Service networking: PASS"
+
+      # ============================================================
+      # 24. kubectl port-forward
+      # ============================================================
+
+      - name: "[Networking] Port Forward Test"
+        if: steps.cluster_strategy.outputs.supported == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LOG="$WORK_DIR/port-forward.log"
+
+          kubectl port-forward \
+            -n "$TEST_NAMESPACE" \
+            service/conformance-app \
+            18080:80 \
+            >"$LOG" 2>&1 &
+
+          PF_PID=$!
+
+          cleanup() {
+            kill "$PF_PID" >/dev/null 2>&1 || true
+            wait "$PF_PID" >/dev/null 2>&1 || true
+          }
+
+          trap cleanup EXIT
+
+          READY=false
+
+          for i in $(seq 1 30); do
+            if curl \
+              --fail \
+              --silent \
+              http://127.0.0.1:18080 \
+              > "$WORK_DIR/response"; then
+
+              READY=true
+              break
+            fi
+
+            sleep 1
+          done
+
+          if [ "$READY" != "true" ]; then
+            cat "$LOG" || true
+            echo "::error::Port-forward did not become ready"
+            exit 1
+          fi
+
+          grep -q \
+            "runner-conformance-ok" \
+            "$WORK_DIR/response"
+
+          echo "kubectl port-forward: PASS"
+
+      # ============================================================
+      # 25. Deployment scale and rollout
+      # ============================================================
+
+      - name: "[Kubernetes] Scale and Rollout"
+        if: steps.cluster_strategy.outputs.supported == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl scale deployment/conformance-app \
+            --replicas=2 \
+            -n "$TEST_NAMESPACE"
+
+          kubectl rollout status \
+            deployment/conformance-app \
+            -n "$TEST_NAMESPACE" \
+            --timeout=120s
+
+          READY="$(
+            kubectl get deployment conformance-app \
+              -n "$TEST_NAMESPACE" \
+              -o jsonpath='{.status.readyReplicas}'
+          )"
+
+          test "$READY" = "2"
+
+          echo "Deployment scaling: PASS"
+
+      # ============================================================
+      # 26. Job lifecycle
+      # ============================================================
+
+      - name: "[Kubernetes] Job Test"
+        if: steps.cluster_strategy.outputs.supported == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl create job conformance-job \
+            --image=busybox:latest \
+            -n "$TEST_NAMESPACE" \
+            -- sh -c 'echo job-ok'
+
+          kubectl wait \
+            --for=condition=Complete \
+            job/conformance-job \
+            -n "$TEST_NAMESPACE" \
+            --timeout=120s
+
+          kubectl logs \
+            job/conformance-job \
+            -n "$TEST_NAMESPACE" \
+            | grep -q "job-ok"
+
+          echo "Kubernetes Job: PASS"
+
+      # ============================================================
+      # 27. RBAC lifecycle
+      # ============================================================
+
+      - name: "[Kubernetes] RBAC Test"
+        if: steps.cluster_strategy.outputs.supported == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl create serviceaccount conformance-reader \
+            -n "$TEST_NAMESPACE"
+
+          kubectl create role conformance-reader \
+            --verb=get \
+            --verb=list \
+            --resource=pods \
+            -n "$TEST_NAMESPACE"
+
+          kubectl create rolebinding conformance-reader \
+            --role=conformance-reader \
+            --serviceaccount="$TEST_NAMESPACE:conformance-reader" \
+            -n "$TEST_NAMESPACE"
+
+          kubectl auth can-i get pods \
+            -n "$TEST_NAMESPACE" \
+            --as="system:serviceaccount:$TEST_NAMESPACE:conformance-reader" \
+            | grep -qx "yes"
+
+          kubectl auth can-i delete namespaces \
+            --as="system:serviceaccount:$TEST_NAMESPACE:conformance-reader" \
+            | grep -qx "no"
+
+          echo "ServiceAccount / Role / RoleBinding: PASS"
+
+      # ============================================================
+      # 28. CRD lifecycle
+      # ============================================================
+
+      - name: "[Kubernetes] CRD Test"
+        if: steps.cluster_strategy.outputs.supported == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "$WORK_DIR/crd.yaml" <<'EOF'
+          apiVersion: apiextensions.k8s.io/v1
+          kind: CustomResourceDefinition
+          metadata:
+            name: widgets.conformance.example
+          spec:
+            group: conformance.example
+            scope: Namespaced
+            names:
+              plural: widgets
+              singular: widget
+              kind: Widget
+            versions:
+              - name: v1
+                served: true
+                storage: true
+                schema:
+                  openAPIV3Schema:
+                    type: object
+                    properties:
+                      spec:
+                        type: object
+                        properties:
+                          message:
+                            type: string
+          EOF
+
+          kubectl apply -f "$WORK_DIR/crd.yaml"
+
+          kubectl wait \
+            --for=condition=Established \
+            crd/widgets.conformance.example \
+            --timeout=60s
+
+          cat > "$WORK_DIR/widget.yaml" <<EOF
+          apiVersion: conformance.example/v1
+          kind: Widget
+          metadata:
+            name: test-widget
+            namespace: ${TEST_NAMESPACE}
+          spec:
+            message: hello
+          EOF
+
+          kubectl apply -f "$WORK_DIR/widget.yaml"
+
+          test "$(
+            kubectl get widget test-widget \
+              -n "$TEST_NAMESPACE" \
+              -o jsonpath='{.spec.message}'
+          )" = "hello"
+
+          kubectl patch widget test-widget \
+            -n "$TEST_NAMESPACE" \
+            --type merge \
+            -p '{"spec":{"message":"updated"}}'
+
+          test "$(
+            kubectl get widget test-widget \
+              -n "$TEST_NAMESPACE" \
+              -o jsonpath='{.spec.message}'
+          )" = "updated"
+
+          kubectl delete widget test-widget \
+            -n "$TEST_NAMESPACE"
+
+          echo "CRD lifecycle: PASS"
+
+      # ============================================================
+      # 29. Helm lifecycle
+      # ============================================================
+
+      - name: "[Helm] Chart Lifecycle Test"
+        if: steps.cluster_strategy.outputs.supported == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CHART="$WORK_DIR/conformance-chart"
+
+          helm create "$CHART"
+
+          helm lint "$CHART"
+
+          helm template \
+            conformance-chart \
+            "$CHART" \
+            --namespace "$TEST_NAMESPACE" \
+            > "$WORK_DIR/helm-rendered.yaml"
+
+          helm install \
+            conformance-chart \
+            "$CHART" \
+            --namespace "$TEST_NAMESPACE" \
+            --set image.repository=nginx \
+            --set image.tag=alpine \
+            --wait \
+            --timeout 3m
+
+          helm status \
+            conformance-chart \
+            --namespace "$TEST_NAMESPACE"
+
+          helm upgrade \
+            conformance-chart \
+            "$CHART" \
+            --namespace "$TEST_NAMESPACE" \
+            --set replicaCount=2 \
+            --set image.repository=nginx \
+            --set image.tag=alpine \
+            --wait \
+            --timeout 3m
+
+          helm uninstall \
+            conformance-chart \
+            --namespace "$TEST_NAMESPACE"
+
+          echo "Helm lifecycle: PASS"
+
+      # ============================================================
+      # 30. Basic storage
+      # ============================================================
+
+      - name: "[Storage] Volume Mount Test"
+        if: steps.cluster_strategy.outputs.supported == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "$WORK_DIR/storage.yaml" <<EOF
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: storage-test
+            namespace: ${TEST_NAMESPACE}
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: storage-test
+                image: busybox:latest
+                command:
+                  - sh
+                  - -c
+                  - |
+                    echo storage-ok > /data/result
+                    cat /data/result
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+            volumes:
+              - name: data
+                emptyDir: {}
+          EOF
+
+          kubectl apply -f "$WORK_DIR/storage.yaml"
+
+          kubectl wait \
+            --for=jsonpath='{.status.phase}'=Succeeded \
+            pod/storage-test \
+            -n "$TEST_NAMESPACE" \
+            --timeout=120s
+
+          kubectl logs storage-test \
+            -n "$TEST_NAMESPACE" \
+            | grep -q "storage-ok"
+
+          echo "emptyDir storage: PASS"
+
+      # ============================================================
+      # 31. Summary
+      # ============================================================
+
+      - name: "[Report] Conformance Summary"
         if: always()
         shell: bash
-        env:
-          NS: ${{ inputs.namespace }}
         run: |
           {
-            echo "# Kubernetes Runner Access Test"
-            echo ""
-            echo "## Runner"
+            echo "# Kubernetes CI Runner Conformance"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Runner | \`${{ matrix.os }}\` |"
-            echo "| Runner architecture | \`${{ steps.arch.outputs.k8s_arch || 'unknown' }}\` |"
-            echo "| Namespace | \`$NS\` |"
-            echo "| Test image | \`$TEST_IMAGE\` |"
+            echo "| Runner | \`${{ matrix.runner }}\` |"
+            echo "| Architecture | \`${{ steps.unique.outputs.arch || 'unknown' }}\` |"
+            echo "| Test ID | \`${{ steps.unique.outputs.test_id || 'unknown' }}\` |"
+            echo "| Privileged containers | \`${{ steps.privileged.outcome }}\` |"
+            echo "| Cluster strategy | \`${{ steps.cluster_strategy.outputs.strategy || 'not-evaluated' }}\` |"
+            echo "| Ephemeral cluster | \`${{ steps.cluster.outcome || 'not-run' }}\` |"
+            echo ""
+            echo "## Interpretation"
             echo ""
 
-            echo "## Prerequisites"
-            echo ""
-            echo "| Test | Result |"
-            echo "|---|---|"
-            echo "| Kubeconfig | ${{ steps.kubeconfig.outcome }} |"
-            echo "| API connectivity | ${{ steps.connectivity.outcome }} |"
-            echo "| Authentication | ${{ steps.auth.outcome }} |"
-            echo ""
-
-            echo "## Functional Tests"
-            echo ""
-            echo "| Test | Result |"
-            echo "|---|---|"
-            echo "| Pod API test | ${{ steps.pod_test.outputs.result || 'not-run' }} |"
-            echo "| Pod runtime | ${{ steps.pod_test.outputs.runtime_result || 'not-run' }} |"
-            echo "| Deployment API test | ${{ steps.deployment_test.outputs.result || 'not-run' }} |"
-            echo "| Deployment scaling | ${{ steps.deployment_test.outputs.scale_result || 'not-run' }} |"
-            echo "| Service API test | ${{ steps.service_test.outputs.result || 'not-run' }} |"
-            echo ""
-
-            echo "## Architecture"
-            echo ""
-            echo "The runner architecture determines which \`kubectl\` binary is installed."
-            echo "The Kubernetes node architecture determines which workload images can run."
-            echo ""
-
-            if [ "${{ steps.connectivity.outcome }}" = "success" ]; then
-              echo "### Kubernetes Nodes"
+            if [ "${{ steps.cluster_strategy.outputs.supported }}" = "true" ]; then
+              echo "This runner was tested using the standard ephemeral Kubernetes-in-Docker CI pattern."
+            else
+              echo "The host and container-runtime tests ran, but the standard kind cluster test was not run because the selected architecture does not have a validated upstream node-image path in this workflow."
               echo ""
-              echo '```text'
-
-              if kubectl auth can-i list nodes 2>/dev/null | grep -qx "yes"; then
-                kubectl get nodes \
-                  -o custom-columns='NAME:.metadata.name,ARCH:.status.nodeInfo.architecture,OS:.status.nodeInfo.operatingSystem,KUBELET:.status.nodeInfo.kubeletVersion' \
-                  2>/dev/null || true
-              else
-                echo "Node listing is not permitted by RBAC."
-              fi
-
-              echo '```'
+              echo "This should be classified as an upstream architecture/tooling limitation, not automatically as a runner permission failure."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       # ============================================================
-      # 16. Always clean up test resources
+      # 32. Diagnostics
       # ============================================================
 
-      - name: "[Cleanup] Remove Test Resources"
-        if: always() && steps.kubeconfig.outcome == 'success'
-        shell: bash
-        env:
-          NS: ${{ inputs.namespace }}
-          POD_NAME: permission-test-${{ github.run_id }}-${{ strategy.job-index }}
-          DEPLOYMENT_NAME: permission-deploy-${{ github.run_id }}-${{ strategy.job-index }}
-          SERVICE_NAME: permission-svc-${{ github.run_id }}-${{ strategy.job-index }}
-        run: |
-          set +e
-
-          echo "=== Cleaning up test resources ==="
-
-          kubectl delete pod "$POD_NAME" \
-            -n "$NS" \
-            --ignore-not-found \
-            --wait=false
-
-          kubectl delete deployment "$DEPLOYMENT_NAME" \
-            -n "$NS" \
-            --ignore-not-found \
-            --wait=false
-
-          kubectl delete service "$SERVICE_NAME" \
-            -n "$NS" \
-            --ignore-not-found
-
-          echo "Cleanup attempt complete."
-
-      # ============================================================
-      # 17. Remove kubeconfig from runner
-      # ============================================================
-
-      - name: "[Cleanup] Remove Kubeconfig"
+      - name: "[Diagnostics] Collect State"
         if: always()
         shell: bash
         run: |
-          rm -f "$KUBECONFIG"
+          set +e
+
+          echo "=== Docker Info ==="
+          docker info
+
+          echo ""
+          echo "=== Docker Containers ==="
+          docker ps -a
+
+          echo ""
+          echo "=== Docker Networks ==="
+          docker network ls
+
+          if command -v kubectl >/dev/null 2>&1; then
+            echo ""
+            echo "=== Kubernetes Nodes ==="
+            kubectl get nodes -o wide
+
+            echo ""
+            echo "=== Kubernetes Pods ==="
+            kubectl get pods -A -o wide
+
+            echo ""
+            echo "=== Kubernetes Events ==="
+            kubectl get events -A \
+              --sort-by='.lastTimestamp'
+          fi
+
+      # ============================================================
+      # 33. Destroy ephemeral cluster
+      # ============================================================
+
+      - name: "[Cleanup] Delete Kubernetes Cluster"
+        if: always() && steps.cluster_strategy.outputs.supported == 'true'
+        shell: bash
+        run: |
+          set +e
+
+          if command -v kind >/dev/null 2>&1; then
+            kind delete cluster \
+              --name "$CLUSTER_NAME"
+          fi
+
+      # ============================================================
+      # 34. Remove test image and leftovers
+      # ============================================================
+
+      - name: "[Cleanup] Remove Container Resources"
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          docker rm -f \
+            $(docker ps -aq \
+              --filter "name=$TEST_ID") \
+            2>/dev/null || true
+
+          docker image rm \
+            "$TEST_IMAGE" \
+            2>/dev/null || true
+
+          docker network rm \
+            "conformance-net-$TEST_ID" \
+            2>/dev/null || true
+
+          docker volume rm \
+            "conformance-volume-$TEST_ID" \
+            2>/dev/null || true
+
+      # ============================================================
+      # 35. Remove all temporary files
+      # ============================================================
+
+      - name: "[Cleanup] Remove Temporary Files"
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then
+            rm -rf "$WORK_DIR"
+          fi
+
+          echo "Temporary files removed."
