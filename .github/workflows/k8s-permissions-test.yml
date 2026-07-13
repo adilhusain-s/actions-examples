@@ -1,0 +1,281 @@
+name: K8s Permissions Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      kubeconfig:
+        description: 'Kubeconfig content (base64 encoded)'
+        required: true
+      namespace:
+        description: 'Namespace to test against'
+        required: true
+        default: 'default'
+      test-image:
+        description: 'Container image for workload creation tests (choose one compatible with your cluster node arch)'
+        required: true
+        default: 'registry.k8s.io/pause:3.10'
+
+env:
+  KUBECONFIG: /tmp/kubeconfig
+  TEST_IMAGE: ${{ github.event.inputs.test-image }}
+
+jobs:
+  k8s-permissions-test:
+    name: K8s Permissions Test - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-24.04-ppc64le-vm, ubuntu-22.04]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Detect Architecture
+        id: arch
+        run: |
+          RAW_ARCH=$(uname -m)
+          echo "Raw arch: $RAW_ARCH"
+          # Map to Kubernetes release arch names:
+          #   x86_64   -> amd64
+          #   aarch64  -> arm64
+          #   ppc64le  -> ppc64le  (no mapping needed)
+          #   s390x    -> s390x    (no mapping needed)
+          case "$RAW_ARCH" in
+            x86_64)  K8S_ARCH="amd64"  ;;
+            aarch64) K8S_ARCH="arm64"  ;;
+            *)       K8S_ARCH="$RAW_ARCH" ;;
+          esac
+          echo "K8s arch: $K8S_ARCH"
+          echo "k8s_arch=$K8S_ARCH" >> $GITHUB_OUTPUT
+
+      - name: Install kubectl
+        run: |
+          K8S_ARCH="${{ steps.arch.outputs.k8s_arch }}"
+          echo "Downloading kubectl for linux/$K8S_ARCH"
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${K8S_ARCH}/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          echo "kubectl version:"
+          kubectl version --client
+
+      - name: Set up kubeconfig
+        run: |
+          # base64 -d works on both GNU (linux) and BSD (macOS) base64
+          echo "${{ github.event.inputs.kubeconfig }}" | base64 -d > $KUBECONFIG
+          chmod 600 $KUBECONFIG
+
+      # ── Section 1: Cluster Connectivity & Authentication ──
+      - name: "[Auth] Test Cluster Connectivity"
+        run: |
+          echo "=== Cluster Info ==="
+          kubectl cluster-info
+          echo "=== API Versions ==="
+          kubectl api-versions | head -20
+          echo "=== Current Context ==="
+          kubectl config current-context
+
+      - name: "[Auth] Test Whoami / Current User"
+        run: |
+          echo "=== Current User ==="
+          kubectl config view --minify -o jsonpath='{.users[0].name}'
+          echo ""
+          echo "=== Auth Check via self-subject-rules ==="
+          kubectl auth can-i --list 2>&1 | head -80
+
+      # ── Section 2: Namespace-scoped Read Permissions ──
+      - name: "[Read] Namespace-scoped Resources"
+        run: |
+          NS="${{ github.event.inputs.namespace }}"
+          echo "=== Testing namespace: $NS ==="
+
+          echo "--- Pods ---"
+          kubectl get pods -n "$NS" 2>&1 || echo "❌ Cannot list pods"
+
+          echo "--- Services ---"
+          kubectl get svc -n "$NS" 2>&1 || echo "❌ Cannot list services"
+
+          echo "--- Deployments ---"
+          kubectl get deployments -n "$NS" 2>&1 || echo "❌ Cannot list deployments"
+
+          echo "--- ConfigMaps ---"
+          kubectl get configmaps -n "$NS" 2>&1 || echo "❌ Cannot list configmaps"
+
+          echo "--- Secrets ---"
+          kubectl get secrets -n "$NS" 2>&1 || echo "❌ Cannot list secrets"
+
+          echo "--- Ingress ---"
+          kubectl get ingress -n "$NS" 2>&1 || echo "❌ Cannot list ingress"
+
+          echo "--- PVCs ---"
+          kubectl get pvc -n "$NS" 2>&1 || echo "❌ Cannot list pvc"
+
+      # ── Section 3: Cluster-scoped Read Permissions ──
+      - name: "[Read] Cluster-scoped Resources"
+        run: |
+          echo "--- Nodes ---"
+          kubectl get nodes 2>&1 || echo "❌ Cannot list nodes"
+
+          echo "--- Namespaces ---"
+          kubectl get namespaces 2>&1 || echo "❌ Cannot list namespaces"
+
+          echo "--- StorageClasses ---"
+          kubectl get storageclasses 2>&1 || echo "❌ Cannot list storageclasses"
+
+          echo "--- PersistentVolumes ---"
+          kubectl get pv 2>&1 || echo "❌ Cannot list persistent volumes"
+
+          echo "--- ClusterRoles ---"
+          kubectl get clusterroles 2>&1 | head -20 || echo "❌ Cannot list clusterroles"
+
+          echo "--- ClusterRoleBindings ---"
+          kubectl get clusterrolebindings 2>&1 | head -20 || echo "❌ Cannot list clusterrolebindings"
+
+          echo "--- CRDs ---"
+          kubectl get crd 2>&1 | head -20 || echo "❌ Cannot list CRDs"
+
+      # ── Section 4: Fine-grained `auth can-i` Checks ──
+      - name: "[RBAC] auth can-i Checks"
+        run: |
+          NS="${{ github.event.inputs.namespace }}"
+          echo "=== Verb-level RBAC checks ==="
+          for resource in pods services deployments configmaps secrets events ingresses pvc; do
+            for verb in get list watch create update patch delete; do
+              result=$(kubectl auth can-i "$verb" "$resource" -n "$NS" 2>/dev/null)
+              echo "$verb $resource = $result"
+            done
+          done
+
+      - name: "[RBAC] Cluster-level auth can-i Checks"
+        run: |
+          echo "=== Cluster-scope RBAC checks ==="
+          for resource in nodes namespaces storageclasses persistentvolumes clusterroles clusterrolebindings; do
+            for verb in get list watch create update patch delete; do
+              result=$(kubectl auth can-i "$verb" "$resource" 2>/dev/null)
+              echo "$verb $resource = $result"
+            done
+          done
+
+      # ── Section 5: Workload Creation Test (if permitted) ──
+      - name: "[Write] Test Pod Creation"
+        run: |
+          NS="${{ github.event.inputs.namespace }}"
+          IMAGE="$TEST_IMAGE"
+          ARCH="${{ steps.arch.outputs.k8s_arch }}"
+          echo "Using test image: $IMAGE"
+          echo "Runner arch: $ARCH"
+          echo ""
+          echo "NOTE: The container image must be compatible with your cluster's node architecture."
+          echo "For ppc64le clusters, consider images like:"
+          echo "  - registry.k8s.io/pause:3.10  (multi-arch, includes ppc64le)  ✅ recommended"
+          echo "  - registry.k8s.io/busybox     (multi-arch, includes ppc64le)"
+          echo "  - ibmcom/pause-ppc64le        (IBM's ppc64le pause image)"
+          echo "For amd64 clusters, any standard image works."
+          echo ""
+
+          CAN_CREATE_POD=$(kubectl auth can-i create pods -n "$NS" 2>/dev/null)
+          if [ "$CAN_CREATE_POD" = "yes" ]; then
+            echo "✅ Can create pods — running workload test"
+
+            # Create a pod using the configurable test image
+            kubectl run permission-test --image="$IMAGE" --restart=Never -n "$NS" 2>&1 || echo "❌ Pod creation failed"
+
+            # Wait briefly for the pod
+            kubectl wait --for=condition=Ready pod/permission-test -n "$NS" --timeout=30s 2>&1 || echo "⚠️ Pod did not become ready (expected for pause image — it holds but doesn't complete)"
+
+            # Get pod details
+            echo "--- Pod Details ---"
+            kubectl get pod permission-test -n "$NS" -o wide 2>&1
+
+            # Try logs (pause image won't have output, but checking permission)
+            kubectl logs permission-test -n "$NS" 2>&1 || echo "⚠️ Could not get logs (expected for pause image)"
+
+            # Clean up
+            kubectl delete pod permission-test -n "$NS" --wait=false 2>&1 || echo "⚠️ Could not delete pod"
+          else
+            echo "❌ Cannot create pods in namespace $NS"
+          fi
+
+      - name: "[Write] Test Deployment Creation"
+        run: |
+          NS="${{ github.event.inputs.namespace }}"
+          IMAGE="$TEST_IMAGE"
+          CAN_CREATE_DEPLOY=$(kubectl auth can-i create deployments -n "$NS" 2>/dev/null)
+          if [ "$CAN_CREATE_DEPLOY" = "yes" ]; then
+            echo "✅ Can create deployments"
+            kubectl create deployment k8s-permission-test --image="$IMAGE" -n "$NS" 2>&1 || echo "❌ Deployment creation failed"
+
+            # Wait for deployment to be available
+            kubectl wait --for=condition=Available deployment/k8s-permission-test -n "$NS" --timeout=30s 2>&1 || echo "⚠️ Deployment did not become Available"
+
+            # Scale test
+            kubectl scale deployment k8s-permission-test --replicas=2 -n "$NS" 2>&1 || echo "❌ Scale failed"
+
+            # Check rollout status
+            kubectl rollout status deployment/k8s-permission-test -n "$NS" --timeout=30s 2>&1 || echo "⚠️ Rollout status check failed"
+
+            # List pods from the deployment
+            kubectl get pods -n "$NS" -l app=k8s-permission-test -o wide 2>&1
+
+            # Clean up
+            kubectl delete deployment k8s-permission-test -n "$NS" 2>&1 || echo "⚠️ Could not delete deployment"
+          else
+            echo "❌ Cannot create deployments in namespace $NS"
+          fi
+
+      # ── Section 6: Service & Ingress Test ──
+      - name: "[Write] Test Service & Ingress Creation"
+        run: |
+          NS="${{ github.event.inputs.namespace }}"
+          CAN_CREATE_SVC=$(kubectl auth can-i create services -n "$NS" 2>/dev/null)
+          if [ "$CAN_CREATE_SVC" = "yes" ]; then
+            echo "✅ Can create services"
+            kubectl create service clusterip test-svc --tcp=80:80 -n "$NS" 2>&1 || echo "❌ Service creation failed"
+            kubectl delete svc test-svc -n "$NS" 2>&1 || echo "⚠️ Could not delete service"
+          else
+            echo "❌ Cannot create services in namespace $NS"
+          fi
+
+      # ── Section 7: Summary Report ──
+      - name: "📊 Permissions Summary Report"
+        run: |
+          NS="${{ github.event.inputs.namespace }}"
+          echo "============================================"
+          echo "   K8s Permissions Test Summary"
+          echo "============================================"
+          echo "Runner:           ${{ matrix.os }}"
+          echo "Namespace:        $NS"
+          echo "Cluster URL:      $(kubectl config view --minify -o jsonpath='{.clusters[0].server}' 2>/dev/null)"
+          echo "Current User:     $(kubectl config view --minify -o jsonpath='{.users[0].name}' 2>/dev/null)"
+          echo ""
+
+          echo "--- Read Access ---"
+          for resource in pods services deployments configmaps secrets events ingresses pvc; do
+            result=$(kubectl auth can-i get "$resource" -n "$NS" 2>/dev/null)
+            echo "  get $resource: $result"
+          done
+
+          echo ""
+          echo "--- Write Access ---"
+          for resource in pods deployments services configmaps secrets; do
+            result=$(kubectl auth can-i create "$resource" -n "$NS" 2>/dev/null)
+            echo "  create $resource: $result"
+            result=$(kubectl auth can-i delete "$resource" -n "$NS" 2>/dev/null)
+            echo "  delete $resource: $result"
+          done
+
+          echo ""
+          echo "--- Cluster Access ---"
+          for resource in nodes namespaces storageclasses persistentvolumes; do
+            result=$(kubectl auth can-i get "$resource" 2>/dev/null)
+            echo "  get $resource: $result"
+          done
+
+          echo ""
+          echo "=== Architecture Notes ==="
+          echo "Runner arch:    ${{ steps.arch.outputs.k8s_arch }}"
+          echo "Test image:     $TEST_IMAGE"
+          echo ""
+          echo "IMPORTANT: The test image must be compatible with your cluster's node architecture."
+          echo "On ppc64le K8s clusters, multi-arch images like 'registry.k8s.io/pause:3.10'"
+          echo "or 'registry.k8s.io/busybox' are recommended since they include ppc64le support."
+          echo "============================================"
