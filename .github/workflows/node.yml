@@ -6,7 +6,7 @@ jobs:
   node-action-example:
     runs-on: ubuntu-24.04-ppc64le-vm
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
       - uses: adilhusain-s/setup-node@main
         with:
           node-version: 20
