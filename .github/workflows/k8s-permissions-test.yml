@@ -75,7 +75,7 @@ jobs:
           echo "CLUSTER_NAME=$CLUSTER_NAME" >> "$GITHUB_ENV"
           echo "TEST_IMAGE=$TEST_IMAGE" >> "$GITHUB_ENV"
           echo "WORK_DIR=$WORK_DIR" >> "$GITHUB_ENV"
-          echo "RUNNER_ARCH=$ARCH" >> "$GITHUB_ENV"
+          echo "CONFORMANCE_ARCH=$ARCH" >> "$GITHUB_ENV"
 
           echo "Test ID:       $TEST_ID"
           echo "Runner arch:   $ARCH"
@@ -373,7 +373,9 @@ jobs:
               https://dl.k8s.io/release/stable.txt
           )"
 
-          URL="https://dl.k8s.io/release/${VERSION}/bin/linux/${RUNNER_ARCH}/kubectl"
+          ARCH="$(echo "${CONFORMANCE_ARCH}" | tr '[:upper:]' '[:lower:]')"
+
+          URL="https://dl.k8s.io/release/${VERSION}/bin/linux/${ARCH}/kubectl"
 
           echo "Downloading: $URL"
 
@@ -439,7 +441,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          case "$RUNNER_ARCH" in
+          case "$CONFORMANCE_ARCH" in
             amd64|arm64)
               echo "strategy=kind" >> "$GITHUB_OUTPUT"
               echo "supported=true" >> "$GITHUB_OUTPUT"
@@ -459,7 +461,7 @@ jobs:
               echo "strategy=unsupported-architecture" >> "$GITHUB_OUTPUT"
               echo "supported=false" >> "$GITHUB_OUTPUT"
 
-              echo "::warning::No validated ephemeral cluster strategy for $RUNNER_ARCH."
+                echo "::warning::No validated ephemeral cluster strategy for $CONFORMANCE_ARCH."
               ;;
           esac
 
