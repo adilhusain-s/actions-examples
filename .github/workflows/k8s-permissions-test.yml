@@ -27,8 +27,9 @@ jobs:
       matrix:
         os: [ubuntu-24.04-ppc64le-vm, ubuntu-22.04]
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      # Note: No checkout is needed — all tools (kubectl) are downloaded at runtime.
+      # This also avoids Node.js dependency issues on self-hosted runners that may
+      # not have the required Node.js version for actions/checkout.
 
       - name: Detect Architecture
         id: arch
@@ -61,8 +62,15 @@ jobs:
       - name: Set up kubeconfig
         run: |
           # base64 -d works on both GNU (linux) and BSD (macOS) base64
-          echo "${{ github.event.inputs.kubeconfig }}" | base64 -d > $KUBECONFIG
-          chmod 600 $KUBECONFIG
+          if echo "${{ github.event.inputs.kubeconfig }}" | base64 -d > $KUBECONFIG 2>/dev/null; then
+            chmod 600 $KUBECONFIG
+            echo "✅ kubeconfig written successfully"
+            echo "K8S_CONFIG_OK=true" >> $GITHUB_ENV
+          else
+            echo "⚠️ Failed to decode kubeconfig (likely a placeholder). Subsequent K8s steps will fail with auth errors."
+            echo "   Provide a valid base64-encoded kubeconfig when triggering the workflow."
+            echo "K8S_CONFIG_OK=false" >> $GITHUB_ENV
+          fi
 
       # ── Section 1: Cluster Connectivity & Authentication ──
       - name: "[Auth] Test Cluster Connectivity"
